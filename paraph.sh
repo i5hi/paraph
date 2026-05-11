@@ -140,6 +140,28 @@ function log_error {
     exit 1
 }
 
+function log_warn {
+    echo -e "${YELLOW:-\033[0;33m}[WARN]${NC} $1" >&2
+}
+
+# Soft check: the .jks itself is password-encrypted, but a world/group-readable
+# keystore is still a smell. Warn (don't fail) so the user knows to tighten it.
+function _warn_loose_keystore_perms {
+    local f="$1"
+    [[ -f "$f" ]] || return 0
+    local mode
+    if [[ "$(uname)" == "Darwin" ]]; then
+        mode=$(stat -f %A "$f" 2>/dev/null)
+    else
+        mode=$(stat -c %a "$f" 2>/dev/null)
+    fi
+    [[ "${#mode}" == 4 ]] && mode="${mode:1}"
+    if [[ -n "$mode" && "${mode:1}" != "00" ]]; then
+        log_warn "$f has permissions $mode — group/other can read this keystore."
+        echo "       The .jks is password-encrypted, but tighten with: chmod 600 \"$f\"" >&2
+    fi
+}
+
 # =============================================================================
 # MAIN LOGIC
 # =============================================================================
@@ -163,6 +185,7 @@ case "$COMMAND" in
                 if [[ ! -f "$ANDROID_KEYSTORE" ]]; then
                     log_error "Keystore not found: $ANDROID_KEYSTORE (set ANDROID_KEYSTORE to the correct path)"
                 fi
+                _warn_loose_keystore_perms "$ANDROID_KEYSTORE"
                 if command -v zipalign >/dev/null 2>&1; then
                     if ! zipalign -c 4 "$FILE" >/dev/null 2>&1; then
                         log_error "APK is not zipaligned. Fix with: zipalign -p 4 \"$FILE\" \"${BASENAME}-aligned.apk\" (then sign the -aligned.apk)"
@@ -171,6 +194,21 @@ case "$COMMAND" in
                     log_info "zipalign not on PATH — skipping alignment check"
                 fi
                 apksigner sign --ks "$ANDROID_KEYSTORE" --ks-key-alias "$ANDROID_ALIAS" --ks-pass "pass:$ANDROID_PASS" --key-pass "pass:$ANDROID_KEY_PASS" --out "$OUT_FILE" "$FILE" && log_success "Created $OUT_FILE" || log_error "Failed"
+                ;;
+            aab)
+                log_info "Signing Android AAB..."
+                OUT_FILE="${BASENAME}-signed.aab"
+                if [[ ! -f "$ANDROID_KEYSTORE" ]]; then
+                    log_error "Keystore not found: $ANDROID_KEYSTORE (set ANDROID_KEYSTORE to the correct path)"
+                fi
+                _warn_loose_keystore_perms "$ANDROID_KEYSTORE"
+                if ! command -v jarsigner >/dev/null 2>&1; then
+                    log_error "jarsigner not found — install a JDK (java 8+) and ensure jarsigner is on PATH"
+                fi
+                # AABs are signed with jarsigner, NOT apksigner. -signedjar writes a separate output
+                # leaving the input untouched. -sigalg/-digestalg force SHA-256 (default is SHA-1
+                # on older JDKs, which Play Console rejects).
+                jarsigner -keystore "$ANDROID_KEYSTORE" -storepass "$ANDROID_PASS" -keypass "$ANDROID_KEY_PASS" -sigalg SHA256withRSA -digestalg SHA-256 -signedjar "$OUT_FILE" "$FILE" "$ANDROID_ALIAS" && log_success "Created $OUT_FILE" || log_error "Failed"
                 ;;
             msix)
                 log_info "Signing Windows MSIX..."
@@ -205,6 +243,12 @@ case "$COMMAND" in
                     log_info "zipalign not on PATH — skipping alignment check"
                 fi
                 apksigner verify --print-certs "$FILE"
+                ;;
+            aab)
+                if ! command -v jarsigner >/dev/null 2>&1; then
+                    log_error "jarsigner not found — install a JDK (java 8+)"
+                fi
+                jarsigner -verify -verbose -certs "$FILE"
                 ;;
             msix)
                 if [ -f "$WINDOWS_CERT" ]; then

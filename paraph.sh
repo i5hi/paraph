@@ -80,11 +80,14 @@ NC='\033[0m' # No Color
 
 function show_help {
     echo -e "${BLUE}Multi-Platform Signing Tool${NC}"
-    echo "Usage: $(basename "$0") <command> <file>"
+    echo "Usage: $(basename "$0") <command> [flags] <file>"
     echo ""
     echo "Commands:"
     echo "  sign    Sign the provided file."
     echo "  verify  Verify the provided file."
+    echo ""
+    echo "Sign flags:"
+    echo "  -xaab   With <file.aab>: also extract a signed universal (fat) APK via bundletool."
     echo ""
     echo "Current Configuration:"
     echo "  MAC_CERT_SUBJECT : $MAC_CERT_SUBJECT"
@@ -166,8 +169,18 @@ function _warn_loose_keystore_perms {
 # MAIN LOGIC
 # =============================================================================
 
-COMMAND=$1
-FILE=$2
+COMMAND="${1:-}"
+shift 2>/dev/null || true
+
+# Optional flag parsing (must come before <file>):
+#   -xaab   only valid with `sign <aab>` — also extracts a universal APK via bundletool.
+EXTRACT_APK=0
+if [[ "${1:-}" == "-xaab" ]]; then
+    EXTRACT_APK=1
+    shift
+fi
+
+FILE="${1:-}"
 
 if [[ -z "$COMMAND" || -z "$FILE" ]]; then show_help; fi
 if [[ ! -f "$FILE" ]]; then log_error "File not found: $FILE"; fi
@@ -175,6 +188,24 @@ if [[ ! -f "$FILE" ]]; then log_error "File not found: $FILE"; fi
 EXT="${FILE##*.}"
 EXT="${EXT,,}"
 BASENAME="${FILE%.*}"
+
+if [[ "$EXTRACT_APK" == "1" && "$EXT" != "aab" ]]; then
+    log_error "-xaab is only valid with .aab files (got .$EXT)"
+fi
+if [[ "$EXTRACT_APK" == "1" && "$COMMAND" != "sign" ]]; then
+    log_error "-xaab is only valid with the 'sign' command"
+fi
+# Fail fast on -xaab if bundletool isn't installed — we don't want to sign the
+# AAB and then bail mid-flow when extraction kicks in, leaving the user with a
+# signed AAB but no APK.
+if [[ "$EXTRACT_APK" == "1" ]] && ! command -v bundletool >/dev/null 2>&1; then
+    echo -e "${RED}[ERROR]${NC} bundletool not installed — required for -xaab." >&2
+    echo "        Install it first, then re-run paraph:" >&2
+    echo "          macOS:  brew install bundletool" >&2
+    echo "          Linux:  download bundletool-all.jar from https://github.com/google/bundletool/releases" >&2
+    echo "                  and wrap as a 'bundletool' command on your PATH" >&2
+    exit 1
+fi
 
 case "$COMMAND" in
     sign)
@@ -208,7 +239,32 @@ case "$COMMAND" in
                 # AABs are signed with jarsigner, NOT apksigner. -signedjar writes a separate output
                 # leaving the input untouched. -sigalg/-digestalg force SHA-256 (default is SHA-1
                 # on older JDKs, which Play Console rejects).
-                jarsigner -keystore "$ANDROID_KEYSTORE" -storepass "$ANDROID_PASS" -keypass "$ANDROID_KEY_PASS" -sigalg SHA256withRSA -digestalg SHA-256 -signedjar "$OUT_FILE" "$FILE" "$ANDROID_ALIAS" && log_success "Created $OUT_FILE" || log_error "Failed"
+                jarsigner -keystore "$ANDROID_KEYSTORE" -storepass "$ANDROID_PASS" -keypass "$ANDROID_KEY_PASS" -sigalg SHA256withRSA -digestalg SHA-256 -signedjar "$OUT_FILE" "$FILE" "$ANDROID_ALIAS" && log_success "Created $OUT_FILE" || log_error "AAB sign failed"
+
+                # -xaab: also extract a signed universal (fat) APK from the AAB via bundletool.
+                # bundletool always signs the APKs it produces; we pass the same keystore so the
+                # output APK is signed with the upload key (same one apksigner would use for APKs).
+                if [[ "$EXTRACT_APK" == "1" ]]; then
+                    log_info "Extracting universal APK via bundletool..."
+                    APKS_ZIP="${BASENAME}.apks"
+                    APK_OUT="${BASENAME}-signed.apk"
+                    TMPD=$(mktemp -d)
+                    bundletool build-apks \
+                        --bundle="$FILE" \
+                        --output="$APKS_ZIP" \
+                        --mode=universal \
+                        --overwrite \
+                        --ks="$ANDROID_KEYSTORE" \
+                        --ks-pass="pass:$ANDROID_PASS" \
+                        --ks-key-alias="$ANDROID_ALIAS" \
+                        --key-pass="pass:$ANDROID_KEY_PASS" \
+                        || { rm -rf "$TMPD" "$APKS_ZIP"; log_error "bundletool build-apks failed"; }
+                    unzip -oq "$APKS_ZIP" universal.apk -d "$TMPD" \
+                        || { rm -rf "$TMPD" "$APKS_ZIP"; log_error "could not extract universal.apk from $APKS_ZIP"; }
+                    mv "$TMPD/universal.apk" "$APK_OUT"
+                    rm -rf "$TMPD" "$APKS_ZIP"
+                    log_success "Created $APK_OUT (universal fat APK — all ABIs)"
+                fi
                 ;;
             msix)
                 log_info "Signing Windows MSIX..."

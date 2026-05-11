@@ -5,9 +5,54 @@
 # =============================================================================
 
 # ANDROID (.apk) configuration
+#
+# Two env vars:
+#   ANDROID_KEYSTORE  — absolute path to the .jks/.keystore file
+#   ANDROID_KEYPROPS  — absolute path to a key.properties file containing:
+#                          storePassword=...
+#                          keyPassword=...
+#                          keyAlias=...
+#
+# If ANDROID_KEYPROPS is unset, falls back to ANDROID_ALIAS / ANDROID_PASS /
+# ANDROID_KEY_PASS env vars (ANDROID_KEY_PASS defaults to ANDROID_PASS).
 : "${ANDROID_KEYSTORE:=$HOME/share/android.keystore}"
+: "${ANDROID_KEYPROPS:=}"
 : "${ANDROID_ALIAS:=my-alias}"
 : "${ANDROID_PASS:=password}"
+: "${ANDROID_KEY_PASS:=$ANDROID_PASS}"
+
+# Load credentials from key.properties if ANDROID_KEYPROPS is set.
+# Values from the file override the env-var defaults above.
+if [[ -n "$ANDROID_KEYPROPS" ]]; then
+    if [[ ! -f "$ANDROID_KEYPROPS" ]]; then
+        echo "ANDROID_KEYPROPS file not found: $ANDROID_KEYPROPS" >&2
+        exit 1
+    fi
+
+    # Permission check — keyprops contains plaintext passwords, must be owner-only.
+    # macOS uses BSD stat (-f %A); Linux uses GNU stat (-c %a). Both return octal.
+    if [[ "$(uname)" == "Darwin" ]]; then
+        _kp_mode=$(stat -f %A "$ANDROID_KEYPROPS" 2>/dev/null)
+    else
+        _kp_mode=$(stat -c %a "$ANDROID_KEYPROPS" 2>/dev/null)
+    fi
+    # Normalise to 3 digits (some stats emit 4 like "0600").
+    [[ "${#_kp_mode}" == 4 ]] && _kp_mode="${_kp_mode:1}"
+    # Refuse if the file is readable by group or other (any non-zero in the last two digits).
+    if [[ -n "$_kp_mode" && "${_kp_mode:1}" != "00" ]]; then
+        echo "[ERROR] $ANDROID_KEYPROPS has permissions ${_kp_mode} — group or other can read it." >&2
+        echo "        This file contains plaintext signing passwords and must be owner-only." >&2
+        echo "        Fix:  chmod 600 \"$ANDROID_KEYPROPS\"" >&2
+        exit 1
+    fi
+
+    _kp_store=$(awk -F= '$1=="storePassword"{sub(/^[^=]*=/,""); sub(/\r$/,""); print; exit}' "$ANDROID_KEYPROPS")
+    _kp_key=$(awk -F=   '$1=="keyPassword"{sub(/^[^=]*=/,"");   sub(/\r$/,""); print; exit}' "$ANDROID_KEYPROPS")
+    _kp_alias=$(awk -F= '$1=="keyAlias"{sub(/^[^=]*=/,"");      sub(/\r$/,""); print; exit}' "$ANDROID_KEYPROPS")
+    [[ -n "$_kp_store" ]] && ANDROID_PASS="$_kp_store"
+    [[ -n "$_kp_key"   ]] && ANDROID_KEY_PASS="$_kp_key"
+    [[ -n "$_kp_alias" ]] && ANDROID_ALIAS="$_kp_alias"
+fi
 
 # WINDOWS (.msix) configuration
 : "${WINDOWS_P12:=$HOME/share/self-signed.p12}"
@@ -45,6 +90,7 @@ function show_help {
     echo "  MAC_CERT_SUBJECT : $MAC_CERT_SUBJECT"
     echo "  MAC_P12 : $MAC_P12"
     echo "  ANDROID_KEYSTORE : $ANDROID_KEYSTORE"
+    echo "  ANDROID_KEYPROPS : ${ANDROID_KEYPROPS:-<not set — using ANDROID_ALIAS / ANDROID_PASS env vars>}"
     echo ""
     echo -e "${YELLOW}=== HOW TO GENERATE SOLID SIGNING KEYS ===${NC}"
 
@@ -114,7 +160,17 @@ case "$COMMAND" in
             apk)
                 log_info "Signing Android APK..."
                 OUT_FILE="${BASENAME}-signed.apk"
-                apksigner sign --ks "$ANDROID_KEYSTORE" --ks-key-alias "$ANDROID_ALIAS" --ks-pass "pass:$ANDROID_PASS" --out "$OUT_FILE" "$FILE" && log_success "Created $OUT_FILE" || log_error "Failed"
+                if [[ ! -f "$ANDROID_KEYSTORE" ]]; then
+                    log_error "Keystore not found: $ANDROID_KEYSTORE (set ANDROID_KEYSTORE to the correct path)"
+                fi
+                if command -v zipalign >/dev/null 2>&1; then
+                    if ! zipalign -c 4 "$FILE" >/dev/null 2>&1; then
+                        log_error "APK is not zipaligned. Fix with: zipalign -p 4 \"$FILE\" \"${BASENAME}-aligned.apk\" (then sign the -aligned.apk)"
+                    fi
+                else
+                    log_info "zipalign not on PATH — skipping alignment check"
+                fi
+                apksigner sign --ks "$ANDROID_KEYSTORE" --ks-key-alias "$ANDROID_ALIAS" --ks-pass "pass:$ANDROID_PASS" --key-pass "pass:$ANDROID_KEY_PASS" --out "$OUT_FILE" "$FILE" && log_success "Created $OUT_FILE" || log_error "Failed"
                 ;;
             msix)
                 log_info "Signing Windows MSIX..."
@@ -141,6 +197,13 @@ case "$COMMAND" in
     verify)
         case "$EXT" in
             apk)
+                if command -v zipalign >/dev/null 2>&1; then
+                    if ! zipalign -c 4 "$FILE" >/dev/null 2>&1; then
+                        log_error "APK is not zipaligned. Fix with: zipalign -p 4 \"$FILE\" \"${BASENAME}-aligned.apk\" then re-sign and re-verify the -aligned.apk"
+                    fi
+                else
+                    log_info "zipalign not on PATH — skipping alignment check"
+                fi
                 apksigner verify --print-certs "$FILE"
                 ;;
             msix)
